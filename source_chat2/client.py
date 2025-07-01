@@ -321,7 +321,7 @@ class ChatClient(tk.Tk):
             else:
                 print(f"操作失败: {message}")
                 messagebox.showerror("操作失败", message)
-                self.on_closing()
+                # self.on_closing()
 
         # --- 更新在线用户列表 ---
         elif action == "update_online_list":
