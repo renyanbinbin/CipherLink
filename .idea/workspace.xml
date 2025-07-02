@@ -4,21 +4,7 @@
     <option name="autoReloadType" value="SELECTIVE" />
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="73a435dc-c0ee-4d19-9f5c-21d87fb58fe8" name="更改" comment="">
-      <change beforePath="$PROJECT_DIR$/source_chat2/1_private.pem" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/source_chat2/1_public.pem" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/source_chat2/2_private.pem" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/source_chat2/2_public.pem" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/source_chat2/3_private.pem" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/source_chat2/3_public.pem" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/source_chat2/temp_received_image.png" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/source_chat2/user1_private.pem" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/source_chat2/user1_public.pem" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/source_chat2/user2_private.pem" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/source_chat2/user2_public.pem" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/source_chat2/user3_private.pem" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/source_chat2/user3_public.pem" beforeDir="false" />
-    </list>
+    <list default="true" id="73a435dc-c0ee-4d19-9f5c-21d87fb58fe8" name="更改" comment="" />
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
     <option name="HIGHLIGHT_NON_ACTIVE_CHANGELIST" value="false" />
@@ -55,7 +41,7 @@
     "Python.test_pydub_playback.executor": "Debug",
     "Python.utils.executor": "Run",
     "RunOnceActivity.ShowReadmeOnStart": "true",
-    "git-widget-placeholder": "bf08d8d6",
+    "git-widget-placeholder": "add__voice-添加透明语音加密通信",
     "last_opened_file_path": "F:/Git/CipherLink/source_chat2",
     "node.js.detected.package.eslint": "true",
     "node.js.detected.package.tslint": "true",
@@ -90,7 +76,7 @@
       <workItem from="1751467910466" duration="5872000" />
       <workItem from="1751473813193" duration="390000" />
       <workItem from="1751474209255" duration="816000" />
-      <workItem from="1751478287821" duration="717000" />
+      <workItem from="1751478287821" duration="1804000" />
     </task>
     <servers />
   </component>
