@@ -1,9 +1,10 @@
-# server.py
-
 import socket
 import threading
 import json
 import hashlib
+import time
+import uuid
+from collections import defaultdict
 
 HOST = '0.0.0.0'  # 监听所有网络接口
 PORT = 8888
@@ -26,6 +27,8 @@ users_db = {}
 online_users = {}
 # 存储待处理的好友请求 {receiver: {sender: status}}，status: pending, accepted, rejected
 friend_requests = {}
+# 新增：存储消息记录 {message_id: (sender, receiver, timestamp)}
+message_store = {}
 
 
 def broadcast_online_list():
@@ -80,6 +83,24 @@ def notify_friend_update(username, friend, action):
                 print(f"[好友更新通知错误] 发送给 {username} 失败: {e}")
 
 
+def notify_message_recall(message_id, recalled_by, receiver):
+    """通知用户消息被撤回"""
+    with online_users_lock:
+        receiver_socket = online_users.get(receiver)
+        if receiver_socket:
+            response = {
+                "action": "message_recalled",
+                "payload": {
+                    "message_id": message_id,
+                    "recalled_by": recalled_by
+                }
+            }
+            try:
+                receiver_socket.sendall((json.dumps(response) + '\n').encode('utf-8'))
+            except Exception as e:
+                print(f"[撤回通知错误] 发送给 {receiver} 失败: {e}")
+
+
 def add_friend_to_db(sender, receiver):
     """将双方添加为好友"""
     with users_lock:
@@ -126,6 +147,30 @@ def remove_friend_from_db(user1, user2):
         notify_friend_request(user2, user1, "remove", "removed")
 
 
+def cleanup_message_store():
+    """定期清理过期的消息记录"""
+    while True:
+        time.sleep(300)  # 每5分钟清理一次
+        current_time = time.time()
+        expired_ids = []
+
+        # 找出超过2分钟的消息
+        for msg_id, (_, _, timestamp) in message_store.items():
+            if current_time - timestamp > 120:  # 2分钟
+                expired_ids.append(msg_id)
+
+        # 删除过期消息
+        for msg_id in expired_ids:
+            del message_store[msg_id]
+            print(f"[清理] 已删除过期消息: {msg_id}")
+
+pending_file_data = {}  # 存储等待传输的文件数据
+# 全局字典，用于管理实时文件传输的接收方
+file_realtime_receivers = {}
+
+# 全局缓存字典
+file_chunk_cache = defaultdict(lambda: defaultdict(list))
+
 def handle_client(client_socket, address):
     """处理单个客户端连接的线程函数"""
     print(f"[新连接] {address} 已连接。")
@@ -137,6 +182,12 @@ def handle_client(client_socket, address):
             request = json.loads(line)
             action = request.get("action")
             payload = request.get("payload", {})
+
+            # 会话验证 - 要求登录的操作
+            if action not in ["register", "login"] and not current_user:
+                response = {"status": "error", "message": "请先登录"}
+                client_socket.sendall((json.dumps(response) + '\n').encode('utf-8'))
+                continue
 
             # --- 注册 ---
             if action == "register":
@@ -183,6 +234,9 @@ def handle_client(client_socket, address):
                     client_socket.sendall((json.dumps(response) + '\n').encode('utf-8'))
                     print(f"[登录] 用户 '{username}' 登录成功。")
                     broadcast_online_list()  # 通知所有人更新列表
+
+                    # 发送等待的文件
+                    send_pending_files(username, client_socket)
                 else:
                     response = {"status": "error", "message": "用户名或密码错误"}
                     client_socket.sendall((json.dumps(response) + '\n').encode('utf-8'))
@@ -204,6 +258,31 @@ def handle_client(client_socket, address):
             elif action == "forward_message":
                 to_user = payload.get("to")
 
+                # +++ 新增：验证是否为好友 +++
+                is_friend = False
+                with users_lock:
+                    # 检查发送方和接收方是否互为好友
+                    if current_user in users_db and to_user in users_db:
+                        # 检查双方是否在彼此的好友列表中
+                        if (current_user in users_db[to_user]["friends"] and
+                                to_user in users_db[current_user]["friends"]):
+                            is_friend = True
+
+                if not is_friend:
+                    # 如果不是好友，返回错误
+                    response = {
+                        "status": "error",
+                        "message": f"无法发送消息：您和 {to_user} 不是好友关系"
+                    }
+                    client_socket.sendall((json.dumps(response) + '\n').encode('utf-8'))
+                    continue
+                # +++ 好友验证结束 +++
+
+                # 新增：存储消息记录
+                message_id = payload.get("message_id")
+                if message_id:
+                    message_store[message_id] = (current_user, to_user, time.time())
+
                 with online_users_lock:
                     target_socket = online_users.get(to_user)
 
@@ -216,6 +295,39 @@ def handle_client(client_socket, address):
                     # 如果对方不在线，可以发送错误回报
                     response = {"status": "error", "message": f"用户 '{to_user}' 不在线。"}
                     client_socket.sendall((json.dumps(response) + '\n').encode('utf-8'))
+
+            # --- 新增：撤回消息 ---
+            elif action == "recall_message":
+                message_id = payload.get("message_id")
+                to_user = payload.get("to")
+
+                # 验证消息是否存在且属于当前用户
+                if message_id not in message_store:
+                    response = {"status": "error", "message": "消息不存在或已过期"}
+                    client_socket.sendall((json.dumps(response) + '\n').encode('utf-8'))
+                    continue
+
+                sender, receiver, timestamp = message_store[message_id]
+
+                if sender != current_user:
+                    response = {"status": "error", "message": "无权撤回该消息"}
+                    client_socket.sendall((json.dumps(response) + '\n').encode('utf-8'))
+                    continue
+
+                # 检查消息是否超过2分钟
+                if time.time() - timestamp > 120:  # 2分钟
+                    response = {"status": "error", "message": "消息已超过可撤回时间"}
+                    client_socket.sendall((json.dumps(response) + '\n').encode('utf-8'))
+                    continue
+
+                # 通知接收方消息已被撤回
+                notify_message_recall(message_id, current_user, receiver)
+
+                # 从消息存储中删除
+                del message_store[message_id]
+
+                response = {"status": "ok", "message": "消息已撤回"}
+                client_socket.sendall((json.dumps(response) + '\n').encode('utf-8'))
 
             # --- 添加好友 ---
             elif action == "add_friend":
@@ -297,6 +409,286 @@ def handle_client(client_socket, address):
                 response = {"status": "ok", "message": f"已成功移除好友 '{friend_name}'。"}
                 client_socket.sendall((json.dumps(response) + '\n').encode('utf-8'))
 
+            # --- 文件传输请求 ---
+            elif action == "file_request":
+                to_user = payload.get("to")
+                file_id = payload.get("file_id")
+                file_name = payload.get("file_name")
+                file_size = payload.get("file_size")
+                file_hash = payload.get("file_hash")
+
+                # 检查接收方是否在线
+                with online_users_lock:
+                    target_socket = online_users.get(to_user)
+
+                if target_socket:
+                    # 添加发送方信息
+                    payload["from"] = current_user
+                    forward_req = {"action": "file_request", "payload": payload}
+                    target_socket.sendall((json.dumps(forward_req) + '\n').encode('utf-8'))
+                else:
+                    response = {"status": "error", "message": f"用户 '{to_user}' 不在线。"}
+                    client_socket.sendall((json.dumps(response) + '\n').encode('utf-8'))
+
+            # --- 文件元数据（开始传输）---
+            elif action == "file_start":
+                # 确保所有必要字段存在
+                if not all(key in payload for key in ["to", "file_id", "file_name", "file_size", "file_hash"]):
+                    response = {"status": "error", "message": "文件元数据不完整"}
+                    client_socket.sendall((json.dumps(response) + '\n').encode('utf-8'))
+                    continue
+
+                to_user = payload.get("to")
+
+                with online_users_lock:
+                    target_socket = online_users.get(to_user)
+
+                if target_socket:
+                    # 添加发送方信息
+                    payload["from"] = current_user
+                    forward_req = {"action": "file_start", "payload": payload}
+                    target_socket.sendall((json.dumps(forward_req) + '\n').encode('utf-8'))
+                else:
+                    # 如果对方不在线，存储文件元数据而不是直接丢弃
+                    store_file_metadata(to_user, payload)
+                    response = {"status": "error", "message": f"用户 '{to_user}' 不在线。文件已存储，将在其上线时通知。"}
+                    client_socket.sendall((json.dumps(response) + '\n').encode('utf-8'))
+
+            # --- 文件块传输 ---
+            elif action == "file_chunk":
+                # 确保所有必要字段存在
+                if not all(key in payload for key in ["to", "file_id", "chunk_data"]):
+                    print("文件块数据不完整")
+                    continue
+
+                to_user = payload.get("to")
+                file_id = payload.get("file_id")
+                chunk_data = payload.get("chunk_data")
+
+                # 获取接收方的socket
+                with online_users_lock:
+                    target_socket = online_users.get(to_user)
+
+                # 如果接收方在线，立即转发
+                if target_socket:
+                    try:
+                        # 添加发送方信息
+                        payload["from"] = current_user
+                        forward_req = {"action": "file_chunk", "payload": payload}
+                        target_socket.sendall((json.dumps(forward_req) + '\n').encode('utf-8'))
+                        print(f"转发文件块 {file_id} 给 {to_user}，块大小: {len(chunk_data)}")
+                    except Exception as e:
+                        print(f"转发文件块给 {to_user} 失败: {e}")
+                        # 转发失败则存储
+                        store_pending_chunk(to_user, file_id, chunk_data)
+                else:
+                    # 接收方不在线，存储为待处理
+                    store_pending_chunk(to_user, file_id, chunk_data)
+
+            # --- 文件传输接受响应 ---
+            elif action == "file_accept":
+                to_user = payload.get("to")  # 这里的to_user是原始发送方
+                file_id = payload.get("file_id")
+                accepted = payload.get("accept")
+
+                # 检查发送方是否在线
+                with online_users_lock:
+                    target_socket = online_users.get(to_user)
+
+                if target_socket:
+                    # 添加接收方信息
+                    payload["from"] = current_user
+                    forward_req = {"action": "file_accept", "payload": payload}
+                    target_socket.sendall((json.dumps(forward_req) + '\n').encode('utf-8'))
+                else:
+                    response = {"status": "error", "message": f"用户 '{to_user}' 不在线。"}
+                    client_socket.sendall((json.dumps(response) + '\n').encode('utf-8'))
+
+
+                # --- 文件传输结束 ---
+            elif action == "file_end":
+                # 确保所有必要字段存在
+                if not all(key in payload for key in ["to", "file_id", "status"]):
+                    response = {"status": "error", "message": "文件结束信息不完整"}
+                    client_socket.sendall((json.dumps(response) + '\n').encode('utf-8'))
+                    continue
+
+                to_user = payload.get("to")
+
+                # 如果接收方在线，尝试转发
+                with online_users_lock:
+                    target_socket = online_users.get(to_user)
+                if target_socket:
+                    # 添加发送方信息
+                    payload["from"] = current_user
+                    forward_req = {"action": "file_end", "payload": payload}
+                    target_socket.sendall((json.dumps(forward_req) + '\n').encode('utf-8'))
+
+
+            # 缓存块请求处理
+
+            elif action == "request_cached_chunks":
+
+                file_id = payload.get("file_id")
+
+                receiver = payload.get("receiver")
+
+                print(f"收到来自 {receiver} 的缓存块请求，文件ID: {file_id}")
+
+                # 检查是否有缓存块
+
+                if receiver in file_chunk_cache and file_id in file_chunk_cache[receiver]:
+
+                    chunks = file_chunk_cache[receiver][file_id]
+
+                    chunk_count = len(chunks)
+
+                    print(f"准备向 {receiver} 发送 {chunk_count} 个缓存块")
+
+                    # 发送所有缓存块
+
+                    for i, chunk in enumerate(chunks):
+                        req = {
+
+                            "action": "cached_chunk",
+
+                            "payload": {
+
+                                "to": receiver,
+
+                                "file_id": file_id,
+
+                                "chunk_data": chunk,
+
+                                "chunk_index": i + 1,  # 索引从1开始
+
+                                "total_chunks": chunk_count
+
+                            }
+
+                        }
+
+                        client_socket.sendall((json.dumps(req) + '\n').encode('utf-8'))
+
+                    # 发送缓存结束通知
+
+                    req = {
+
+                        "action": "cached_chunks_end",
+
+                        "payload": {
+
+                            "file_id": file_id,
+
+                            "chunk_count": chunk_count
+
+                        }
+
+                    }
+
+                    client_socket.sendall((json.dumps(req) + '\n').encode('utf-8'))
+
+                    # 清理缓存
+
+                    del file_chunk_cache[receiver][file_id]
+
+                    print(f"已向 {receiver} 发送所有缓存块并清除缓存")
+
+                else:
+
+                    print(f"接收方 {receiver} 无缓存块")
+
+                    # 没有缓存块时也发送结束通知
+
+                    req = {
+
+                        "action": "cached_chunks_end",
+
+                        "payload": {
+
+                            "file_id": file_id,
+
+                            "chunk_count": 0
+
+                        }
+
+                    }
+
+                    client_socket.sendall((json.dumps(req) + '\n').encode('utf-8'))
+
+
+            # 接收方准备就绪处理
+
+            elif action == "ready_for_realtime":
+
+                file_id = payload.get("file_id")
+
+                receiver = payload.get("receiver")
+
+                # 设置实时传输标志
+
+                if file_id not in file_realtime_receivers:
+                    file_realtime_receivers[file_id] = []
+
+                file_realtime_receivers[file_id].append(receiver)
+
+                print(f"{receiver} 已准备好接收实时块，文件ID: {file_id}")
+
+
+            # 文件块处理 (更新部分)
+
+            elif action == "file_chunk":
+
+                to_user = payload.get("to")
+
+                file_id = payload.get("file_id")
+
+                chunk_data = payload.get("chunk_data")
+
+                # 首先检查是否有缓存块需要存储
+
+                # ...（原有逻辑，但命名改成file_chunk_cache）...
+
+                # 然后检查是否有实时接收方需要转发
+
+                if file_id in file_realtime_receivers:
+
+                    for receiver in file_realtime_receivers[file_id]:
+
+                        if receiver in online_users:
+
+                            try:
+
+                                # 转发给实时接收方
+
+                                forward_req = {
+
+                                    "action": "file_chunk",
+
+                                    "payload": {
+
+                                        "to": receiver,
+
+                                        "file_id": file_id,
+
+                                        "chunk_data": chunk_data,
+
+                                        "source": "realtime"
+
+                                    }
+
+                                }
+
+                                online_users[receiver].sendall((json.dumps(forward_req) + '\n').encode('utf-8'))
+
+                            except Exception as e:
+
+                                print(f"转发实时块给 {receiver} 失败: {e}")
+                    # 接收方不在线时，存储到统一缓存
+                else:
+                    store_pending_chunk(to_user, file_id, chunk_data)
+                    print(f"存储文件块到缓存: {file_id} (接收方: {to_user})")
+
     except (ConnectionResetError, BrokenPipeError, json.JSONDecodeError) as e:
         print(f"[连接错误] {address}: {e}")
     finally:
@@ -310,11 +702,77 @@ def handle_client(client_socket, address):
         client_socket.close()
 
 
+# 在全局范围内定义存储待处理文件的字典
+pending_files = {}
+
+
+# 在 server.py 顶部添加全局存储
+file_transfer_data = {}  # {file_id: {"metadata": {...}, "chunks": [...]}}
+
+# 修改 store_file_metadata 函数
+def store_file_metadata(receiver, metadata):
+    file_id = metadata["file_id"]
+    if receiver not in file_transfer_data:
+        file_transfer_data[receiver] = {}
+    if file_id not in file_transfer_data[receiver]:
+        file_transfer_data[receiver][file_id] = {
+            "metadata": metadata,
+            "chunks": []  # 存储所有文件块
+        }
+
+# 修改 send_pending_files 函数
+def send_pending_files(username, client_socket):
+    """当用户上线时发送所有等待的文件"""
+    if username in pending_file_data:
+        for file_id, file_data in pending_file_data[username].items():
+            # 发送文件元数据
+            metadata = file_data["metadata"]
+            forward_req = {"action": "file_start", "payload": metadata}
+            client_socket.sendall((json.dumps(forward_req) + '\n').encode('utf-8'))
+
+            # 发送所有文件块
+            for chunk in file_data["chunks"]:
+                chunk_payload = {
+                    "to": username,
+                    "file_id": file_id,
+                    "chunk_data": chunk,
+                    "from": metadata["from"]  # 保留原始发送者
+                }
+                forward_req = {"action": "file_chunk", "payload": chunk_payload}
+                client_socket.sendall((json.dumps(forward_req) + '\n').encode('utf-8'))
+
+            # 如果收到了结束标志，发送它
+            if file_data.get("end_received", False):
+                end_payload = file_data["end_data"]
+                end_payload["to"] = username
+                forward_req = {"action": "file_end", "payload": end_payload}
+                client_socket.sendall((json.dumps(forward_req) + '\n').encode('utf-8'))
+
+        # 清理已发送的文件
+        del pending_file_data[username]
+
+# 全局缓存字典
+cached_chunks = defaultdict(lambda: defaultdict(list))
+
+pending_file_chunks = defaultdict(lambda: defaultdict(list))
+
+
+def store_pending_chunk(receiver, file_id, chunk_data):
+    """存储待处理的文件块到统一缓存"""
+    # 同时存储到两种结构中确保兼容性
+    pending_file_chunks[receiver][file_id].append(chunk_data)
+    file_chunk_cache[receiver][file_id].append(chunk_data)
+
+
 def main():
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.bind((HOST, PORT))
     server.listen(5)
     print(f"[*] 服务器正在监听 {HOST}:{PORT}")
+
+    # 启动消息清理线程
+    cleanup_thread = threading.Thread(target=cleanup_message_store, daemon=True)
+    cleanup_thread.start()
 
     while True:
         client_socket, address = server.accept()
