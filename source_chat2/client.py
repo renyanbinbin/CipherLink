@@ -24,6 +24,9 @@ SERVER_PORT = 8888
 TEMP_IMAGE_PATH = "temp_chat_image.png"
 
 
+from voice import VoiceRecorder
+
+
 class ChatClient(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -89,6 +92,13 @@ class ChatClient(tk.Tk):
 
         # 将 protocol 调用移到 on_closing 方法定义之后
         self.protocol("WM_DELETE_WINDOW", self.on_closing)
+
+        # 语音功能相关
+        self.recording = False  # 录音状态标志
+        self.record_duration = 0  # 录音时长
+        self.last_voice_file = None  # 最后录制的语音文件路径
+        self.voice_recorder = None  # 语音录制器实例
+
 
     def setup_chat_ui(self):
         """登录成功后，创建主聊天界面"""
@@ -172,6 +182,28 @@ class ChatClient(tk.Tk):
         self.steg_button.pack(side=tk.RIGHT)
         print("创建了藏图按钮")
 
+        # 添加语音按钮
+        voice_frame = tk.Frame(input_frame)
+        voice_frame.pack(side=tk.LEFT, padx=5)
+
+        self.voice_button = tk.Button(voice_frame, text="录音", command=self.start_voice_recording)
+        self.voice_button.pack(side=tk.LEFT)
+
+        self.stop_voice_button = tk.Button(voice_frame, text="停止", command=self.stop_voice_recording,
+                                           state=tk.DISABLED)
+        self.stop_voice_button.pack(side=tk.LEFT)
+
+        self.voice_duration_label = tk.Label(voice_frame, text="0秒")
+        self.voice_duration_label.pack(side=tk.LEFT, padx=5)
+
+        self.play_voice_button = tk.Button(voice_frame, text="播放", command=self.play_last_voice_message,
+                                           state=tk.DISABLED)
+        self.play_voice_button.pack(side=tk.LEFT)
+        # 在语音按钮下方添加进度条
+        self.voice_progress = ttk.Progressbar(voice_frame, orient=tk.HORIZONTAL, mode='determinate')
+        self.voice_progress.pack(fill=tk.X, pady=5)
+        self.voice_progress.pack_forget()  # 默认隐藏
+
         print("聊天界面创建完成")
         self.update()  # 强制更新界面
         print("界面更新完成")
@@ -201,6 +233,136 @@ class ChatClient(tk.Tk):
 
         self.file_transfers = {}  # 确保已定义
         self.pending_file_chunks = {}  # 新增：存储尚未接受的待处理文件块
+
+    def start_voice_recording(self):
+        """开始录音"""
+        if not self.current_chat_partner:
+            messagebox.showerror("错误", "请先选择一个聊天好友。")
+            return
+
+        if self.recording:
+            return
+
+        self.recording = True
+        self.record_duration = 0
+        self.voice_button.config(state=tk.DISABLED)
+        self.stop_voice_button.config(state=tk.NORMAL)
+        self.play_voice_button.config(state=tk.DISABLED)
+        self.voice_duration_label.config(text="0秒")
+
+        # 初始化录音器
+        self.voice_recorder = VoiceRecorder()
+
+        # 启动录音线程
+        recording_thread = threading.Thread(
+            target=self._record_voice_thread,
+            daemon=True
+        )
+        recording_thread.start()
+
+    def _record_voice_thread(self):
+        """录音线程"""
+
+        def update_duration(seconds):
+            self.after(0, lambda: self.voice_duration_label.config(text=f"{seconds}秒"))
+
+        voice_file = self.voice_recorder.record_audio(
+            f"voice_{self.username}",
+            update_duration
+        )
+
+        self.after(0, self._handle_recording_finished, voice_file)
+
+    def _handle_recording_finished(self, voice_file):
+        """录音完成后的处理"""
+        self.recording = False
+        self.voice_button.config(state=tk.NORMAL)
+        self.stop_voice_button.config(state=tk.DISABLED)
+
+        if voice_file:
+            # 如果存在上一个录音文件且不是当前文件，则删除它
+            if self.last_voice_file and os.path.exists(self.last_voice_file) and self.last_voice_file != voice_file:
+                try:
+                    os.remove(self.last_voice_file)
+                    print(f"已删除旧录音文件: {self.last_voice_file}")
+                except Exception as e:
+                    print(f"删除旧录音文件失败: {e}")
+
+            self.last_voice_file = voice_file
+            self.play_voice_button.config(state=tk.NORMAL)
+            # 询问是否发送
+            if messagebox.askyesno("发送语音", "录音完成，是否发送？", parent=self):
+                self.send_voice_message(voice_file)
+        else:
+            messagebox.showerror("错误", "录音失败或没有录到声音")
+
+    def stop_voice_recording(self):
+        """停止录音"""
+        if self.recording and self.voice_recorder:
+            self.voice_recorder.stop_recording()
+
+    def send_voice_message(self, voice_file_path):
+        """发送语音消息"""
+        if not self.current_chat_partner:
+            return
+
+        session_key = self.session_keys.get(self.current_chat_partner)
+        if not session_key:
+            messagebox.showerror("错误", "尚未与该用户建立安全连接。")
+            return
+
+        try:
+            # 读取语音文件
+            with open(voice_file_path, 'rb') as f:
+                voice_data = f.read()
+
+            # 加密语音数据
+            encrypted_voice_b64 = self.voice_recorder.encrypt_voice_data(session_key, voice_data)
+            if not encrypted_voice_b64:
+                raise Exception("语音加密失败")
+
+            # 生成唯一消息ID
+            message_id = f"voice_{uuid.uuid4().hex}"
+
+            # 获取录音时长
+            actual_duration = int(self.voice_recorder.get_audio_duration(voice_file_path))
+
+            # 发送到服务器
+            req = {
+                "action": "forward_message",
+                "payload": {
+                    "to": self.current_chat_partner,
+                    "type": "voice",
+                    "content": encrypted_voice_b64,
+                    "message_id": message_id,
+                    "duration": actual_duration  # 使用实际时长
+                }
+            }
+            self.send_to_server(req)
+
+            # 在聊天框中显示语音消息
+            self.chat_box.config(state='normal')
+            msg_start = self.chat_box.index(tk.INSERT)
+            self.display_message(self.username, f"[语音消息, {actual_duration}秒]",  # 使用实际时长
+                                 self.current_chat_partner, message_id)
+            msg_end = self.chat_box.index(tk.INSERT)
+            self.chat_box.config(state='disabled')
+
+            # 存储已发送消息
+            self.sent_messages[message_id] = (self.current_chat_partner, "voice", msg_start)
+
+        except Exception as e:
+            messagebox.showerror("错误", f"发送语音消息失败: {e}")
+        # finally:
+        #     try:
+        #         os.remove(voice_file_path)
+        #     except:
+        #         pass
+
+    def play_last_voice_message(self):
+        """播放最后录制的语音消息"""
+        if hasattr(self, 'last_voice_file') and self.last_voice_file:
+            self.voice_recorder.play_voice_message(file_path=self.last_voice_file)
 
     def show_progress(self, label, total):
         """显示传输进度条"""
@@ -555,6 +717,42 @@ class ChatClient(tk.Tk):
                         print(f"解密文本消息时出错: {e}")
                 else:
                     self.display_message("System", f"收到来自{from_user}的加密消息，但没有会话密钥。", from_user)
+
+            #如果是语音消息
+            elif msg_type == "voice":
+                encrypted_voice_b64 = payload.get("content")
+                duration = payload.get("duration", 0)
+                message_id = payload.get("message_id")
+
+                session_key = self.session_keys.get(from_user)
+                if session_key:
+                    # 如果当前聊天对象是消息发送者，直接显示消息
+                    if not hasattr(self, 'voice_recorder') or self.voice_recorder is None:
+                        self.voice_recorder = VoiceRecorder()
+
+                    if self.current_chat_partner == from_user:
+                        self.display_message(from_user, f"[语音消息, {duration}秒]", from_user, message_id)
+                        # 提供播放按钮
+                        self.chat_box.config(state='normal')
+                        self.chat_box.insert(tk.END, "[点击播放] ", ("voice_play", message_id))
+                        self.chat_box.tag_bind(message_id, "<Button-1>",
+                                               lambda e, msg_id=message_id: self.play_received_voice(msg_id))
+                        self.chat_box.insert(tk.END, "\n")
+                        self.chat_box.config(state='disabled')
+
+                        # 存储语音数据以便播放
+                        if not hasattr(self, 'received_voice_messages'):
+                            self.received_voice_messages = {}
+                        self.received_voice_messages[message_id] = {
+                            "data": encrypted_voice_b64,
+                            "session_key": session_key
+                        }
+                    else:
+                        # 否则存储为未读消息
+                        self.add_unread_voice(from_user, encrypted_voice_b64, duration, message_id)
+                else:
+                    self.display_message("System", f"收到来自{from_user}的语音消息，但没有会话密钥。", from_user)
+
 
             # 如果是加密的图片消息
             elif msg_type == "steganography":
@@ -1168,6 +1366,24 @@ class ChatClient(tk.Tk):
                     img = Image.open(io.BytesIO(msg["data"]))
                     self.display_image_message(friend_name, img, f"隐藏消息: {msg['hidden_message']}", friend_name,
                                                msg.get("message_id"))
+                elif msg["type"] == "voice":
+                    self.display_message(friend_name, f"[语音消息, {msg['duration']}秒]", friend_name,
+                                         msg.get("message_id"))
+                    # 提供播放按钮
+                    self.chat_box.config(state='normal')
+                    self.chat_box.insert(tk.END, "[点击播放] ", ("voice_play", msg.get("message_id")))
+                    self.chat_box.tag_bind(msg.get("message_id"), "<Button-1>",
+                                           lambda e, msg_id=msg.get("message_id"): self.play_received_voice(msg_id))
+                    self.chat_box.insert(tk.END, "\n")
+                    self.chat_box.config(state='disabled')
+
+                    # 存储语音数据以便播放
+                    if not hasattr(self, 'received_voice_messages'):
+                        self.received_voice_messages = {}
+                    self.received_voice_messages[msg.get("message_id")] = {
+                        "data": msg["content"],
+                        "session_key": msg["session_key"]
+                    }
 
             # 清空未读消息
             self.unread_messages[friend_name] = []
@@ -1597,6 +1813,12 @@ class ChatClient(tk.Tk):
             except Exception as e:
                 print(f"关闭套接字时出错: {e}")
 
+        # 清理语音临时文件
+        if hasattr(self, 'last_voice_file') and self.last_voice_file is not None and os.path.exists(
+                self.last_voice_file):
+            os.remove(self.last_voice_file)
+            print(f"Removed temporary voice file: {self.last_voice_file}")
+
         # 清理临时文件
         try:
             if os.path.exists(TEMP_IMAGE_PATH):
@@ -1607,6 +1829,60 @@ class ChatClient(tk.Tk):
 
         self.destroy()
         print("客户端已关闭")
+
+    def play_received_voice(self, message_id):
+        """播放接收到的语音消息"""
+        if not hasattr(self, 'voice_recorder') or self.voice_recorder is None:
+            self.voice_recorder = VoiceRecorder()
+
+        if not hasattr(self, 'received_voice_messages') or message_id not in self.received_voice_messages:
+            messagebox.showerror("错误", "语音消息不存在或已过期")
+            return
+
+        # 获取语音数据
+        voice_data = self.received_voice_messages[message_id]
+
+        # 更新UI：禁用按钮并显示状态
+        self.play_voice_button.config(state=tk.DISABLED, text="播放中...")
+        self.update()  # 强制刷新UI
+
+        try:
+            # 在子线程中播放
+            def _play_thread():
+                self.voice_recorder.play_voice_message(
+                    encrypted_voice_b64=voice_data["data"],
+                    session_key=voice_data["session_key"]
+                )
+                # 播放完成后恢复按钮状态
+                self.after(0, lambda: self.play_voice_button.config(state=tk.NORMAL, text="播放"))
+
+            threading.Thread(target=_play_thread, daemon=True).start()
+
+        except Exception as e:
+            messagebox.showerror("播放失败", f"无法播放语音: {e}")
+            self.play_voice_button.config(state=tk.NORMAL, text="播放")
+
+    def add_unread_voice(self, sender, encrypted_voice_b64, duration, message_id):
+        """添加未读语音消息"""
+        if sender not in self.unread_messages:
+            self.unread_messages[sender] = []
+
+        self.unread_messages[sender].append({
+            "type": "voice",
+            "content": encrypted_voice_b64,
+            "duration": duration,
+            "timestamp": time.time(),
+            "message_id": message_id,
+            "session_key": self.session_keys.get(sender)  # 存储会话密钥以便解密
+        })
+
+        # 更新好友列表提示
+        self.update_friend_indicator(sender)
+
+        # 显示系统通知
+        self.display_message("System", f"收到来自 {sender} 的语音消息", sender)
+
+
 
 
 if __name__ == "__main__":
