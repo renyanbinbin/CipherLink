@@ -7,7 +7,12 @@ import threading
 import sys
 import uuid
 import sounddevice as sd
-import numpy as np # 如果还没有导入 numpy 的话
+import numpy as np
+import warnings
+
+# 在导入 pydub 之前过滤掉 RuntimeWarning
+warnings.filterwarnings("ignore", category=RuntimeWarning, module='pydub.utils')
+
 
 # 导入加密工具
 import crypto_utils as c_utils
