@@ -13,6 +13,7 @@ import sys
 import time
 import uuid
 import hashlib
+import glob
 
 # 导入我们的加密和信息隐藏工具
 import crypto_utils as c_utils
@@ -41,6 +42,8 @@ class ChatClient(tk.Tk):
 
         # 存储会话密钥 { 'friend_username': b'aes_key' }
         self.session_keys = {}
+        self.session_keys = {}
+        self.offline_keys = {}
         # 存储好友的公钥 { 'friend_username': public_key_object }
         self.friend_public_keys = {}
 
@@ -536,6 +539,8 @@ class ChatClient(tk.Tk):
             print(f"发送登录请求: {req}")
             self.send_to_server(req)
 
+        self._load_offline_keys()  # 登录时加载离线密钥
+
     def register(self):
         """处理注册逻辑"""
         username = self.username_entry.get()
@@ -715,8 +720,22 @@ class ChatClient(tk.Tk):
 
                     except Exception as e:
                         print(f"解密文本消息时出错: {e}")
+
+                elif payload.get("is_offline"):
+                    try:
+                        
+                        decrypted = c_utils.aes_decrypt(
+                            self.offline_keys[from_user],  # 使用offline_key
+                            base64.b64decode(payload["content"])
+                        )
+                        self.add_unread_message(from_user, decrypted.decode(), message_id)
+                    except Exception as e:
+                        print(f"离线消息解密失败: {e}")  
+
                 else:
                     self.display_message("System", f"收到来自{from_user}的加密消息，但没有会话密钥。", from_user)
+
+
 
             #如果是语音消息
             elif msg_type == "voice":
@@ -1801,9 +1820,36 @@ class ChatClient(tk.Tk):
             for chunk in iter(lambda: f.read(4096), b""):
                 sha256.update(chunk)
         return sha256.hexdigest()
+    
+    def _save_offline_keys(self):
+        """明文存储离线密钥到本地文件"""
+        if not os.path.exists('offline_keys'):
+            os.makedirs('offline_keys', mode=0o700)  # 限制目录权限
+
+        for username, key in self.offline_keys.items():
+            try:
+                # 直接存储Base64编码的密钥（不加密）
+                with open(f'offline_keys/{self.username}_{username}.key', 'wb') as f:
+                    f.write(base64.b64encode(key))  # 仅Base64编码
+            except Exception as e:
+                print(f"存储离线密钥失败: {e}")
+
+    def _load_offline_keys(self):
+        """加载明文存储的离线密钥"""
+        pattern = f'offline_keys/{self.username}_*.key'
+        for file in glob.glob(pattern):
+            try:
+                with open(file, 'rb') as f:
+                    key = base64.b64decode(f.read())  # 直接解码
+                    target_user = file.split('_')[-1].split('.')[0]
+                    self.offline_keys[target_user] = key
+            except Exception as e:
+                print(f"加载离线密钥失败: {e}")
 
     def on_closing(self):
         """关闭窗口时的清理工作"""
+        self.offline_keys = self.session_keys.copy()
+        self._save_offline_keys()  # 新增本地存储
         print("正在关闭客户端...")
         self.connected = False
         if self.sock:
