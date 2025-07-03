@@ -42,6 +42,7 @@
 
 ```bash
 pip install cryptography Pillow
+pip install pyaudio
 ```
 
 ### 2. 获取代码
