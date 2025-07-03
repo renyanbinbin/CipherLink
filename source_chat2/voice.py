@@ -9,10 +9,11 @@ import uuid
 import sounddevice as sd
 import numpy as np
 import warnings
+# 新增: 语音识别库
+import speech_recognition as sr
 
 # 在导入 pydub 之前过滤掉 RuntimeWarning
 warnings.filterwarnings("ignore", category=RuntimeWarning, module='pydub.utils')
-
 
 # 导入加密工具
 import crypto_utils as c_utils
@@ -46,6 +47,11 @@ except ImportError:
         "警告: 未安装 pydub 或 simpleaudio，语音消息将使用 WAV 格式且播放可能受限。建议安装: pip install pydub simpleaudio")
     print("注意: pydub 还需要安装FFmpeg到ffmpeg_bin目录下。")
 
+# 新增: 检查 speech_recognition
+try:
+    import speech_recognition as sr
+except ImportError:
+    print("警告: 未安装 SpeechRecognition 库 (pip install SpeechRecognition)。语音转文字功能将不可用。")
 
 
 class VoiceRecorder:
@@ -163,6 +169,51 @@ class VoiceRecorder:
         print("[语音模块] 请求停止录音...")
         self.stop_event.set()
 
+    # 新增方法: 语音转文字
+    def transcribe_voice(self, voice_data):
+        """
+        将WAV格式的语音数据转录为中文文本。
+        :param voice_data: 包含WAV音频的字节数据。
+        :return: 转录的文本或错误信息。
+        """
+        if 'sr' not in globals():
+            return "错误: SpeechRecognition 库未安装。"
+        if not voice_data:
+            return "错误: 无语音数据可供转录。"
+
+        recognizer = sr.Recognizer()
+
+        # 将字节数据写入临时WAV文件，因为AudioFile需要一个文件路径
+        temp_wav_path = f"temp_transcribe_{uuid.uuid4().hex}.wav"
+        try:
+            # 假设 voice_data 已经是完整的 WAV 文件内容
+            with wave.open(temp_wav_path, "wb") as wf:
+                wf.setnchannels(self.channels)
+                wf.setsampwidth(pyaudio.PyAudio().get_sample_size(self.audio_format))
+                wf.setframerate(self.rate)
+                wf.writeframes(voice_data)
+
+            # 从临时文件识别
+            with sr.AudioFile(temp_wav_path) as source:
+                audio_data = recognizer.record(source)
+
+            # 识别语音
+            try:
+                # 使用Google Web Speech API进行识别，指定语言为中文
+                text = recognizer.recognize_google(audio_data, language='zh-CN')
+                return text
+            except sr.UnknownValueError:
+                return "识别失败: 无法理解的音频。"
+            except sr.RequestError as e:
+                return f"识别服务出错: {e}"
+
+        except Exception as e:
+            return f"转录过程中出错: {e}"
+        finally:
+            # 清理临时文件
+            if os.path.exists(temp_wav_path):
+                os.remove(temp_wav_path)
+
     def play_voice_message(self, encrypted_voice_b64=None, session_key=None, file_path=None):
         """
         解密并播放语音消息。
@@ -202,6 +253,7 @@ class VoiceRecorder:
         """解密语音数据"""
         try:
             encrypted_voice = base64.b64decode(encrypted_voice_b64)
+            # AES解密返回的是原始音频数据，而不是文件内容
             decrypted_voice = c_utils.aes_decrypt(session_key, encrypted_voice)
             return decrypted_voice
         except Exception as e:
@@ -232,34 +284,25 @@ class VoiceRecorder:
                 if PYDUB_AVAILABLE:
                     audio = AudioSegment.from_wav(file_path)
                     try:
-                        # 获取音频样本数组。pydub对于立体声会返回1D数组（交错），
-                        # 而sounddevice期望2D数组（采样点数, 通道数）。
                         samples = audio.get_array_of_samples()
                         channels = audio.channels
                         frame_rate = audio.frame_rate
 
-                        # 如果是多声道，需要重塑数组
                         if channels > 1:
-                            # pydub返回的是bytes或array.array，转换为numpy数组
                             samples = np.array(samples).reshape(-1, channels)
                         else:
-                            samples = np.array(samples)  # 单声道直接转numpy
+                            samples = np.array(samples)
 
-                        # 使用 sounddevice 播放
                         sd.play(samples, samplerate=frame_rate)
-                        sd.wait()  # 等待播放完成
-
+                        sd.wait()
                         print(f"[语音模块] 通过 sounddevice 播放完毕: {file_path}")
 
                     except Exception as sd_e:
                         print(f"[语音模块] 警告: 使用 sounddevice 播放失败 ({sd_e})，尝试使用 pydub.playback.play。")
-                        # 如果 sounddevice 播放失败，回退到 pydub 默认的播放方式
                         play(audio)
                         print(f"[语音模块] 通过 pydub.playback.play 播放完毕: {file_path}")
-
                 else:
-                    # 保持原有的 pyaudio/wave 播放逻辑不变，作为 pydub 也不可用时的最终回退
-                    p = pyaudio.PyAudio()  # 确保 p 对象在这里被初始化，或者它是一个类成员
+                    p = pyaudio.PyAudio()
                     wf = wave.open(file_path, 'rb')
                     stream = p.open(format=p.get_format_from_width(wf.getsampwidth()),
                                     channels=wf.getnchannels(),
@@ -272,34 +315,28 @@ class VoiceRecorder:
                         data = wf.readframes(self.chunk)
 
                     stream.stop_stream()
-                    # 只有当 p 对象在当前函数作用域内创建时才在这里终止
-                    # 如果 p 是 VoiceRecorder 类的成员，则其生命周期应由类管理
                     stream.close()
                     wf.close()
-                    # 如果 pyaudio.PyAudio() 在这里创建，则在这里终止
-                    # 否则，如果您在 __init__ 中初始化它，请在 __del__ 或 on_closing 中终止
-                    # 这里假设它是局部创建的
                     p.terminate()
 
                     print(f"[语音模块] 通过 PyAudio 播放完毕: {file_path}")
             except Exception as e:
                 print(f"[语音模块] 播放过程中出错: {e}")
             finally:
-                # 确保资源被正确释放
                 if stream:
                     stream.close()
                 if wf:
                     wf.close()
-                p.terminate()
+                if p and p.is_stream_active(stream):
+                    p.terminate()
 
             print(f"[语音模块] 播放完毕: {file_path}")
         except Exception as e:
             print(f"[语音模块] 播放语音文件失败: {e}, 文件: {file_path}")
         finally:
-            # 延迟删除文件，确保播放完成
-            time.sleep(1)  # 等待1秒确保播放完成
+            time.sleep(1)
             try:
-                if os.path.exists(file_path):
+                if os.path.exists(file_path) and file_path.startswith("temp_received_voice"):
                     os.remove(file_path)
                     print(f"[语音模块] 已删除临时播放文件: {file_path}")
             except Exception as e:
